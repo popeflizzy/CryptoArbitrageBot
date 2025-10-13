@@ -110,6 +110,6 @@ python src/test_binance_auth.py
 
 ---
 
-**Maintained by:** White Rose 🌹  
-**Internship Supervisor:** [Your Supervisor’s Name]  
-**Institution:** College of Engineering, [Your University Name]
+**Maintained by:** Uchiha233 🌹  
+**Internship Supervisor:** [Eli]  
+**Institution:** Dipper Lab
