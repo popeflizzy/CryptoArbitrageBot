@@ -1,55 +1,81 @@
-"""
-coinbase_client.py
-------------------
-Async WebSocket client for Coinbase.
-Streams trades, ticker, and level2 orderbook for BTC/USDT.
-Yields (timestamp_received, latency_ms) for multi_runner.
-"""
-
+# debug coinbase_client.py
 import asyncio
 import json
 import websockets
 from datetime import datetime, timezone
 
-COINBASE_URL = "wss://ws-feed.exchange.coinbase.com"
-PRODUCT_ID = "BTC-USDT"
-CHANNELS = ["ticker", "matches", "level2"]
+COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+TRY_PRODUCTS = ["BTC-USD", "BTC-USDT", "BTC-USD-PERP"]  # try common variants
 
-
-async def subscribe(ws):
-    sub_msg = {
+async def run_coinbase(queue):
+    subscribe_template = {
         "type": "subscribe",
-        "product_ids": [PRODUCT_ID],
-        "channels": CHANNELS,
+        "channels": [{"name": "level2", "product_ids": []}]
     }
-    await ws.send(json.dumps(sub_msg))
-    print("[coinbase] Connected & subscribed.")
 
-
-async def handler(ws):
-    async for msg in ws:
-        now = datetime.now(timezone.utc)
-        data = json.loads(msg)
-
-        # Coinbase has "time" field in ISO format for most messages
-        server_time = data.get("time")
-        if server_time:
-            try:
-                event_dt = datetime.fromisoformat(server_time.replace("Z", "+00:00"))
-                latency = (now - event_dt).total_seconds() * 1000  # ms
-                yield now.isoformat(), latency
-            except Exception:
-                continue
-
-
-async def run_coinbase():
-    """Connects to Coinbase websocket, handles auto-reconnect & yields messages."""
+    reconnect_delay = 1
     while True:
-        try:
-            async with websockets.connect(COINBASE_URL, ping_interval=20) as ws:
-                await subscribe(ws)
-                async for tick in handler(ws):
-                    yield tick
-        except Exception as e:
-            print(f"[coinbase] Error: {e}, reconnecting in 3s...")
-            await asyncio.sleep(3)
+        for product in TRY_PRODUCTS:
+            try:
+                print(f"[coinbase] Attempt subscribe to {product}")
+                async with websockets.connect(COINBASE_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                    sub = subscribe_template.copy()
+                    sub["channels"] = [{"name": "level2", "product_ids": [product]}]
+                    await ws.send(json.dumps(sub))
+                    print(f"[coinbase] Sent subscribe for {product}")
+
+                    # wait for subscription ack or messages for 8s
+                    seen_ack = False
+                    msg_count = 0
+                    async for raw in ws:
+                        msg_count += 1
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            print("[coinbase] Received non-json message")
+                            continue
+
+                        # print subscription ack once
+                        if not seen_ack and data.get("type") in ("subscriptions", "snapshot"):
+                            print(f"[coinbase] Subscribe ack/snapshot for {product}: {data.get('type')}")
+                            seen_ack = True
+
+                        # print sample messages (first 6)
+                        if msg_count <= 6:
+                            print(f"[coinbase] RAW #{msg_count}: {json.dumps(data)[:400]}")
+                        elif msg_count == 7:
+                            print(f"[coinbase] ...more messages received (counting)")
+
+                        # when l2update occurs, normalize and push
+                        if data.get("type") == "l2update":
+                            changes = data.get("changes", [])
+                            bids, asks = [], []
+                            for side, price, size in changes:
+                                if side == "buy":
+                                    bids.append([float(price), float(size)])
+                                else:
+                                    asks.append([float(price), float(size)])
+                            ts = data.get("time") or datetime.now(timezone.utc).isoformat()
+                            await queue.put({
+                                "exchange": "coinbase",
+                                "type": "orderbook",
+                                "product": product,
+                                "bids": bids,
+                                "asks": asks,
+                                "timestamp": ts
+                            })
+
+                        # break after some activity to allow checking next product if nothing useful
+                        if msg_count > 50:
+                            print(f"[coinbase] Received {msg_count} messages for {product}, staying connected.")
+                            # keep connected indefinitely for this product
+                            # but to avoid tight loops if product invalid, stay open
+                            # continue reading
+                    # end async for
+            except Exception as e:
+                print(f"[coinbase] Attempt {product} error: {e}")
+                await asyncio.sleep(reconnect_delay)
+                continue
+        # if all products failed, wait then retry list
+        print("[coinbase] All product attempts failed; sleeping before retrying products...")
+        await asyncio.sleep(5)

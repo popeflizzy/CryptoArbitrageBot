@@ -1,60 +1,53 @@
-"""
-binance_client.py
------------------
-Async WebSocket client for Binance.
-Streams trades, ticker, and orderbook for BTC/USDT.
-Yields (timestamp_received, latency_ms) for multi_runner.
-"""
-
+# debug binance_client.py
 import asyncio
 import json
 import websockets
 from datetime import datetime, timezone
 
-BINANCE_URL = "wss://stream.binance.com:9443/ws"
-SYMBOL = "btcusdt"
-CHANNELS = [
-    f"{SYMBOL}@trade",
-    f"{SYMBOL}@ticker",
-    f"{SYMBOL}@depth5@100ms",  # top 5 orderbook updates
-]
+BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@depth5@100ms"
 
-
-async def subscribe(ws):
-    sub_msg = {
-        "method": "SUBSCRIBE",
-        "params": CHANNELS,
-        "id": 1,
-    }
-    await ws.send(json.dumps(sub_msg))
-    print("[binance] Subscribed to trade, ticker, and depth5 channels.")
-
-
-async def handler(ws):
-    async for msg in ws:
-        now = datetime.now(timezone.utc)
-        data = json.loads(msg)
-
-        # Binance sends many types; handle trade, ticker, or depth
-        event_type = data.get("e")
-
-        # Each event contains a server timestamp "T" or "E"
-        event_ts = data.get("T") or data.get("E")
-        if event_ts:
-            event_dt = datetime.fromtimestamp(event_ts / 1000, tz=timezone.utc)
-            latency = (now - event_dt).total_seconds() * 1000  # ms
-            yield now.isoformat(), latency
-
-
-async def run_binance():
-    """Connects to Binance websocket, handles auto-reconnect & yields messages."""
+async def run_binance(queue):
+    reconnect_delay = 1
     while True:
         try:
-            async with websockets.connect(BINANCE_URL, ping_interval=20) as ws:
-                await subscribe(ws)
-                print("[binance] Connected.")
-                async for tick in handler(ws):
-                    yield tick
+            print("[binance] Connecting to depth5 stream...")
+            async with websockets.connect(BINANCE_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                print("[binance] Connected to depth5 stream.")
+                count = 0
+                async for raw in ws:
+                    count += 1
+                    try:
+                        data = json.loads(raw)
+                    except Exception:
+                        print("[binance] Received non-json raw")
+                        continue
+
+                    # print first few raw messages
+                    if count <= 8:
+                        print(f"[binance] RAW #{count}: {json.dumps(data)[:400]}")
+                    elif count == 9:
+                        print("[binance] ...more messages (suppressing further raw prints)")
+
+                    # Normalize: Binance sometimes wraps stream messages under 'e' / 'E' or 'data'
+                    d = data.get("data") if "data" in data else data
+                    if not d:
+                        continue
+
+                    bids = []
+                    asks = []
+                    if "bids" in d and "asks" in d:
+                        bids = [[float(p), float(q)] for p, q in d.get("bids", [])][:5]
+                        asks = [[float(p), float(q)] for p, q in d.get("asks", [])][:5]
+                        ts = (datetime.fromtimestamp(d.get("E") / 1000, tz=timezone.utc).isoformat()
+                              if d.get("E") else datetime.now(timezone.utc).isoformat())
+                        await queue.put({
+                            "exchange": "binance",
+                            "type": "orderbook",
+                            "bids": bids,
+                            "asks": asks,
+                            "timestamp": ts
+                        })
         except Exception as e:
-            print(f"[binance] Error: {e}, reconnecting in 3s...")
-            await asyncio.sleep(3)
+            print(f"[binance] Error: {e}, reconnecting in 2s...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)
