@@ -1,53 +1,72 @@
-# debug binance_client.py
 import asyncio
 import json
-import websockets
+import aiohttp
 from datetime import datetime, timezone
 
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@depth5@100ms"
+BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@depth5"
 
-async def run_binance(queue):
-    reconnect_delay = 1
+
+async def run_binance(queue: asyncio.Queue):
+    """
+    Binance public depth5 stream -> normalized messages pushed to queue.
+    Schema pushed:
+    {
+      "exchange": "binance",
+      "bids": [[price, size], ...],
+      "asks": [[price, size], ...],
+      "best_bid": float or None,
+      "best_ask": float or None,
+      "timestamp": ISO str
+    }
+    """
+    backoff = 1
     while True:
         try:
             print("[binance] Connecting to depth5 stream...")
-            async with websockets.connect(BINANCE_WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                print("[binance] Connected to depth5 stream.")
-                count = 0
-                async for raw in ws:
-                    count += 1
-                    try:
-                        data = json.loads(raw)
-                    except Exception:
-                        print("[binance] Received non-json raw")
-                        continue
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(BINANCE_WS_URL, heartbeat=20) as ws:
+                    print("[binance] Connected to depth5 stream.")
+                    backoff = 1
+                    async for msg in ws:
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            continue
+                        try:
+                            data = json.loads(msg.data)
+                        except Exception:
+                            continue
 
-                    # print first few raw messages
-                    if count <= 8:
-                        print(f"[binance] RAW #{count}: {json.dumps(data)[:400]}")
-                    elif count == 9:
-                        print("[binance] ...more messages (suppressing further raw prints)")
+                        # Some endpoints wrap under "data" — handle both shapes
+                        d = data.get("data", data)
 
-                    # Normalize: Binance sometimes wraps stream messages under 'e' / 'E' or 'data'
-                    d = data.get("data") if "data" in data else data
-                    if not d:
-                        continue
+                        # Binance depth5 typically has "bids" and "asks"
+                        bids_raw = d.get("bids") or []
+                        asks_raw = d.get("asks") or []
 
-                    bids = []
-                    asks = []
-                    if "bids" in d and "asks" in d:
-                        bids = [[float(p), float(q)] for p, q in d.get("bids", [])][:5]
-                        asks = [[float(p), float(q)] for p, q in d.get("asks", [])][:5]
-                        ts = (datetime.fromtimestamp(d.get("E") / 1000, tz=timezone.utc).isoformat()
-                              if d.get("E") else datetime.now(timezone.utc).isoformat())
+                        # ensure lists of [price, size]
+                        bids = []
+                        asks = []
+                        try:
+                            for p, q in bids_raw:
+                                bids.append([float(p), float(q)])
+                            for p, q in asks_raw:
+                                asks.append([float(p), float(q)])
+                        except Exception:
+                            # ignore malformed message
+                            continue
+
+                        best_bid = bids[0][0] if bids else None
+                        best_ask = asks[0][0] if asks else None
+                        ts = datetime.now(timezone.utc).isoformat()
+
                         await queue.put({
                             "exchange": "binance",
-                            "type": "orderbook",
                             "bids": bids,
                             "asks": asks,
-                            "timestamp": ts
+                            "best_bid": best_bid,
+                            "best_ask": best_ask,
+                            "timestamp": ts,
                         })
         except Exception as e:
-            print(f"[binance] Error: {e}, reconnecting in 2s...")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 30)
+            print(f"[binance] Connection error: {e}, reconnecting in {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
