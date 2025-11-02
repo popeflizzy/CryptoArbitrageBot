@@ -1,54 +1,43 @@
 import asyncio
-import signal
-import sys
+import logging
+
 from src.websockets.binance_client import run_binance
 from src.websockets.okx_client import run_okx
 from src.websockets.orderbook_manager import OrderBookManager
+from src.execution.simulated_executor import SimulatedExecutor
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 
 async def _main():
     queue = asyncio.Queue()
+
     obm = OrderBookManager()
+    executor = SimulatedExecutor(obm)
+    obm.executor = executor
 
-    print("Starting multi_runner (Binance + OKX + OrderBookManager)...")
+    logger.info("Starting multi_runner (Binance + OKX + OrderBookManager)...")
 
+    # run_binance and run_okx are async functions (not classes)
     tasks = [
-        asyncio.create_task(run_binance(queue), name="binance"),
-        asyncio.create_task(run_okx(queue), name="okx"),
-        asyncio.create_task(obm.consume_queue(queue), name="consume"),
-        asyncio.create_task(obm.monitor_loop(interval=3.0), name="monitor"),
+        asyncio.create_task(run_binance(queue)),
+        asyncio.create_task(run_okx(queue)),
+        asyncio.create_task(obm.consume_queue(queue)),
     ]
 
-    stop_event = asyncio.Event()
+    await asyncio.gather(*tasks)
 
-    def _shutdown():
-        print("\n[system] Shutdown requested — stopping...")
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    # best-effort to register signal handlers; some platforms (Windows) may not support add_signal_handler
-    try:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, _shutdown)
-    except NotImplementedError:
-        # Windows: fallback - KeyboardInterrupt will be caught in run()
-        pass
-
-    # wait until signal or stop_event set
-    await stop_event.wait()
-
-    # cancel tasks and wait for them
-    print("[system] Cancelling tasks...")
-    for t in tasks:
-        t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-    print("[system] Shutdown complete. Bye 👋")
 
 def run():
     try:
         asyncio.run(_main())
     except KeyboardInterrupt:
-        # final fallback for windows Ctrl+C
-        print("\n[system] Forced stop detected. Exiting...")
+        logger.info("Shutdown requested — closing gracefully.")
+
 
 if __name__ == "__main__":
     run()
